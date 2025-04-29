@@ -2,7 +2,7 @@ import streamlit as st
 import networkx as nx
 import matplotlib.pyplot as plt
 import random
-import time  # <-- Corrected: Import time
+import time
 from groq import Groq
 
 # --- Streamlit App Setup ---
@@ -10,7 +10,7 @@ st.set_page_config(page_title="PoliBot: Global Crisis Negotiation Simulator", la
 st.title("🌐 PoliBot: Global Crisis Negotiation Simulator")
 
 # --- Groq API Setup ---
-groq_client = Groq(api_key="GROQ_API_KEY")  # <-- Put your Groq API key here
+groq_client = Groq(api_key="")  # <-- Replace with your Groq API key
 MODEL = "llama3-70b-8192"
 
 # --- Helper Function to Generate LLM Message ---
@@ -46,10 +46,19 @@ scenario = st.sidebar.selectbox(
     ("🌪️ Climate Collapse", "🦠 Pandemic Outbreak", "⚡ Energy Crisis", "🚰 Water Scarcity", "🛂 Refugee Crisis")
 )
 
+# Countries with flags 🌎
+all_countries = [
+    "🇺🇸 USA", "🇨🇳 China", "🇮🇳 India", "🇷🇺 Russia", "🇩🇪 Germany",
+    "🇧🇷 Brazil", "🇫🇷 France", "🇬🇧 UK", "🇯🇵 Japan", "🇿🇦 South Africa",
+    "🇨🇦 Canada", "🇸🇦 Saudi Arabia", "🇦🇺 Australia", "🇮🇹 Italy", "🇪🇸 Spain",
+    "🇲🇽 Mexico", "🇰🇷 South Korea", "🇪🇬 Egypt", "🇹🇷 Turkey", "🇦🇷 Argentina",
+    "🇳🇬 Nigeria", "🇮🇩 Indonesia"
+]
+
 nations = st.sidebar.multiselect(
     "Select Participating Nations",
-    ["USA", "China", "India", "Russia", "Germany", "Brazil", "France", "UK", "Japan", "South Africa"],
-    default=["USA", "China", "India"]
+    all_countries,
+    default=["🇺🇸 USA", "🇨🇳 China", "🇮🇳 India"]
 )
 
 speed = st.sidebar.slider("Simulation Speed (seconds per turn)", min_value=0, max_value=10, value=3)
@@ -130,14 +139,14 @@ if start_simulation:
             # Update Treaty Board
             treaty_board.table({"Proposal": [d for d in dialogue[-5:]]})
 
-            # Update Graph Visualization
-            plt.figure(figsize=(6, 4))
-            pos = nx.spring_layout(G, seed=42)
+            # Update Graph Visualization (Simplified)
+            plt.figure(figsize=(6, 6))
+            pos = nx.circular_layout(G)  # More compact layout
             nx.draw(G, pos, with_labels=True, node_color="skyblue", node_size=1500, edge_color="gray")
             graph_placeholder.pyplot(plt)
             plt.clf()
 
-            time.sleep(speed)   # <-- CORRECTED Sleep
+            time.sleep(speed)
 
         # Final Summary
         peace_change = random.uniform(-0.2, 0.2)
