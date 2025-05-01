@@ -526,7 +526,7 @@ def generate_country_card(country):
     return card
 
 # --- UI Layout ---
-st.title("🌐 PoliBot Agents: Advanced Crisis Negotiation Simulator")
+st.title("🌐 PoliBot: Global Crisis Negotiation Simulator")
 
 col_main, col_sidebar = st.columns([3, 1]) # Main content area wider
 
