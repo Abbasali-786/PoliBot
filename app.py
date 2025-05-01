@@ -7,17 +7,17 @@ from groq import Groq
 import io
 from datetime import datetime
 import traceback # Added for detailed error logging
+import re # For parsing agent responses
 
 # --- App Configuration ---
 st.set_page_config(
-    page_title="🌐 PoliBot : Crisis Simulation",
+    page_title="🌐 PoliBot Agents: Crisis Simulation",
     layout="wide",
-    page_icon="🌍",
+    page_icon="🤖", # Changed icon
     initial_sidebar_state="expanded"
 )
 
 # --- Custom CSS Styling ---
-# Removed .report-style as it's no longer needed
 st.markdown("""
     <style>
     .main {
@@ -34,24 +34,30 @@ st.markdown("""
     .stButton>button:hover {
         background-color: #0056b3;
     }
-    /* Removed .report-style CSS */
     .log-entry {
         padding: 0.75rem;
         margin-bottom: 0.5rem;
         border-radius: 8px;
         background-color: #f8f9fa;
-        border-left: 4px solid #4dabf7;
+        border-left: 4px solid #6c757d; /* Default border color */
         font-size: 0.95em;
     }
-    /* Removed treaty-card CSS as we are using st.info now */
-    /* Keep h3 and h4 styles if used elsewhere, otherwise can remove */
+    /* Style log entries based on intent */
+    .log-entry.intent-deal { border-left-color: #28a745; } /* Green for deals */
+    .log-entry.intent-respond { border-left-color: #ffc107; } /* Yellow for responses */
+    .log-entry.intent-comment { border-left-color: #17a2b8; } /* Cyan for comments */
+    .log-entry.intent-alliance { border-left-color: #007bff; } /* Blue for alliances */
+    .log-entry.intent-assist { border-left-color: #fd7e14; } /* Orange for assistance */
+    .log-entry.intent-concern { border-left-color: #dc3545; } /* Red for concerns */
+    .log-entry.intent-decline { border-left-color: #6c757d; } /* Grey for decline */
+
     h3 {
        color: #0056b3;
        border-bottom: 2px solid #007bff;
        padding-bottom: 0.3rem;
        margin-bottom: 1rem;
     }
-    h4 { /* Style for treaty heading */
+    h4 { /* Style for treaty heading / country card */
         color: #333;
         margin-top: 1rem;
         margin-bottom: 0.5rem;
@@ -63,12 +69,12 @@ st.markdown("""
 try:
     # IMPORTANT: Replace with your actual Groq API key or use Streamlit secrets
     # Example using secrets (recommended):
-    groq_api_key = st.secrets["GROQ_API_KEY"]
+    groq_api_key = st.secrets.get("GROQ_API_KEY", None) # Use .get for safety
+    if not groq_api_key:
+        st.error("Groq API Key not found in Streamlit secrets (GROQ_API_KEY). Please add it.", icon="🚨")
+        st.stop()
+
     groq_client = Groq(api_key=groq_api_key)
-
-    # Using placeholder key for demonstration (REPLACE THIS)
-    # groq_client = Groq(api_key=") # Replace with your key
-
     # Simple check (optional, consumes minimal quota)
     groq_client.models.list()
 except Exception as e:
@@ -121,6 +127,19 @@ COUNTRY_PROFILES = {
         "interests": ["African Development", "Regional Stability", "Trade Partnerships (BRICS, etc.)", "Addressing Inequality"],
         "color": "#007A4D"
     },
+    # --- Added Countries ---
+    "Pakistan": {
+        "strengths": ["Strategic Location", "Nuclear Capability", "Large Population", "Military Experience"],
+        "weaknesses": ["Economic Volatility", "Political Instability", "Water Scarcity", "Regional Security Challenges"],
+        "interests": ["National Security", "Economic Stability", "Kashmir Issue", "Regional Influence", "Counter-terrorism"],
+        "color": "#006600" # Dark Green
+    },
+    "EU": { # Representing the European Union as a collective actor
+        "strengths": ["Large Single Market", "Regulatory Power", "Diplomatic Network", "Economic Aid"],
+        "weaknesses": ["Internal Divisions", "Bureaucracy", "Military Dependence (on members/NATO)", "Demographic Challenges"],
+        "interests": ["European Integration", "Economic Prosperity", "Climate Action", "Rule of Law", "Neighborhood Stability"],
+        "color": "#003399" # EU Blue
+    }
 }
 
 # --- Scenario Database ---
@@ -157,166 +176,343 @@ SCENARIO_DETAILS = {
      }
 }
 
+# --- Country Agent Class ---
+class CountryAgent:
+    """Represents a country's AI agent in the simulation."""
+    def __init__(self, name, profile, groq_client):
+        """
+        Initializes the agent.
+
+        Args:
+            name (str): The name of the country the agent represents.
+            profile (dict): The country's profile (strengths, weaknesses, interests).
+            groq_client: An initialized Groq API client instance.
+        """
+        self.name = name
+        self.profile = profile
+        self.groq = groq_client
+        self.memory = [] # Stores recent log entries relevant to this agent
+
+    def remember(self, log_entry):
+        """
+        Adds a log entry to the agent's memory and keeps it concise.
+
+        Args:
+            log_entry (str): The plain text log entry describing an event or action.
+        """
+        self.memory.append(log_entry)
+        # Keep only the last N memories (e.g., 10)
+        if len(self.memory) > 10:
+            self.memory.pop(0)
+
+    def act(self, scenario, scenario_details, turn, all_nations):
+        """
+        Determines the agent's action for the current turn using the Groq API.
+
+        Args:
+            scenario (str): The name of the current crisis scenario.
+            scenario_details (dict): Details of the scenario.
+            turn (int): The current simulation turn number.
+            all_nations (list): List of all nations participating in the simulation.
+
+        Returns:
+            str: The raw action string returned by the Groq API, expected in
+                 "[Intent]: ...\n[Target]: ...\n[Message]: ..." format.
+                 Returns a default "Decline to act" message on error.
+        """
+        # Prepare recent memory for the prompt
+        memory_log = '\n'.join(self.memory[-5:]) if self.memory else "No recent memory." # Use last 5 memories
+
+        # Filter out self from potential targets
+        other_nations = [n for n in all_nations if n != self.name]
+        target_options = ", ".join(other_nations) + ", GLOBAL"
+
+        # Construct the prompt for the LLM
+        prompt = f"""
+You are the official diplomatic representative (AI agent) of the country *{self.name}*.
+
+Your job is to *negotiate, strategize, and act in the best interest of your country* during an international crisis simulation. You must be proactive, thoughtful, and aligned with national objectives.
+
+---
+
+## 🌍 Current Global Crisis:
+*{scenario}*
+- Description: {scenario_details['description']}
+- Key Issues: {', '.join(scenario_details['key_issues'])}
+- Historical Precedents: {scenario_details['historical']}
+
+---
+
+## 🏧 Your Country Profile ({self.name}):
+- Strengths: {', '.join(self.profile.get('strengths', ['N/A']))}
+- Weaknesses: {', '.join(self.profile.get('weaknesses', ['N/A']))}
+- National Interests: {', '.join(self.profile.get('interests', ['N/A']))}
+
+---
+
+## 🎯 Your Current Strategic Mission (as of Turn {turn}):
+Analyze recent events and interactions. Based on your memory and position, choose your next diplomatic action.
+
+Your options for [Intent]:
+1. Propose a deal (Offer a specific exchange or agreement)
+2. Respond (React to a previous proposal or action directed at you - check memory)
+3. Comment (Make a statement about the crisis or another nation's actions)
+4. Build alliances (Suggest cooperation or partnership)
+5. Request assistance (Ask for specific aid or support)
+6. Raise a global concern (Highlight a major issue needing collective attention)
+7. Decline to act (Pass the turn if no strategic move is beneficial)
+
+Your options for [Target]:
+- Choose one specific country from: {target_options}
+- Choose 'GLOBAL' for general statements or concerns.
+
+---
+
+## 🧠 Recent Memory (Relevant events from last 5 turns):
+{memory_log}
+
+---
+
+## 🗣 Output Format (MUST follow this structure EXACTLY):
+
+[Intent]: (Choose ONE from the 7 options above)
+[Target]: (Choose ONE from the target options list)
+[Message]: (Your diplomatic message - 2-4 concise sentences. Be specific, reflect your interests, and relate to the crisis or memory.)
+
+
+---
+Example Output:
+[Intent]: Propose a deal
+[Target]: USA
+[Message]: We propose a joint investment in climate-resilient agriculture technology. This aligns with our shared food security interests given the current crisis.
+
+---
+
+Remember:
+- Reflect your national agenda ({', '.join(self.profile.get('interests', ['N/A']))}).
+- Consider other countries' likely priorities based on the crisis.
+- Act decisively to advance your interests or manage the crisis.
+- Respond ONLY with the specified format. Do not add explanations or greetings.
+"""
+
+        # Call the Groq API
+        try:
+            completion = self.groq.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "system", "content": prompt}],
+                temperature=0.75, # Slightly higher temp for more varied diplomatic actions
+                max_tokens=250, # Enough for the structured output
+                stop=None # Let the model finish
+            )
+            action_text = completion.choices[0].message.content.strip()
+            # Basic validation of the output format
+            if "[Intent]:" in action_text and "[Target]:" in action_text and "[Message]:" in action_text:
+                return action_text
+            else:
+                # Handle malformed response
+                print(f"Warning: Malformed response from {self.name}: {action_text}")
+                return f"[Intent]: Decline to act\n[Target]: GLOBAL\n[Message]: (Agent decided to observe this turn due to unclear instructions or malformed response template)"
+
+        except Exception as e:
+            # Handle API errors or other exceptions
+            print(f"Error during API call for {self.name}: {e}")
+            traceback.print_exc() # Print detailed error
+            return f"[Intent]: Decline to act\n[Target]: GLOBAL\n[Message]: (Technical difficulties prevented action: {e})"
+
 # --- Helper Functions ---
-def generate_negotiation_message(speaker, receiver, scenario, negotiation_style, turn, context_log):
-    scenario_details = SCENARIO_DETAILS[scenario]
-    recent_interactions = "\n".join(context_log[-3:]) # Use last 3 interactions
 
-    system_prompt = f"""
-    You are an expert simulator of a diplomat representing {speaker}, negotiating with {receiver}.
-    The global crisis is: {scenario} - {scenario_details['description']}
-    Key crisis issues: {', '.join(scenario_details['key_issues'])}
-    Historical context: {scenario_details['historical']}
-
-    Your country ({speaker}) profile: {COUNTRY_PROFILES.get(speaker, {'interests': ['National Survival']})}
-    Their country ({receiver}) profile: {COUNTRY_PROFILES.get(receiver, {'interests': ['National Survival']})}
-
-    Negotiation style to adopt: {negotiation_style}.
-    Current negotiation round: {turn}.
-
-    Recent context (last few interactions in the simulation):
-    {recent_interactions if recent_interactions else "No recent interactions logged yet."}
-
-    **Task:** Generate a realistic, concise (2-4 sentences) diplomatic message from {speaker} to {receiver}.
-    * **Reflect:** Your message must reflect {speaker}'s interests, strengths, and weaknesses.
-    * **Acknowledge:** Consider {receiver}'s likely interests and position.
-    * **Address:** Relate directly to the {scenario} crisis and its key issues.
-    * **Style:** Adhere strictly to the assigned {negotiation_style} (Cooperative: seek win-win, build trust; Competitive: assert demands, use leverage; Mixed: blend approaches, perhaps conditional offers).
-    * **Progress:** Your message should logically follow the negotiation turn and recent context (if any). Avoid generic statements. Be specific if possible (e.g., propose a specific action, request specific information, state a clear position).
-    * **Format:** Output only the diplomatic message text, without any preamble or explanation.
+def parse_action(action_text):
     """
+    Parses the agent's action string into intent, target, and message.
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Draft the diplomatic message from {speaker} to {receiver} for turn {turn}."}
-    ]
+    Args:
+        action_text (str): The raw string from the agent's act() method.
 
+    Returns:
+        tuple: (intent, target, message) or (None, None, None) if parsing fails.
+    """
+    intent, target, message = None, None, None
     try:
-        chat_completion = groq_client.chat.completions.create(
-            messages=messages,
-            model=MODEL,
-            temperature=0.75, # Adjust for creativity vs. predictability
-            max_tokens=200,
-            stop=None # Allow model to complete naturally
-        )
-        reply = chat_completion.choices[0].message.content
-        # Clean up potential markdown or quotes if model adds them
-        reply = reply.strip().replace('"', '').replace("```", "").strip()
-        return reply if reply else f"(Error: Empty response from model for {speaker} to {receiver})"
+        # Use regex to find the components, allowing for variations in spacing/newlines
+        intent_match = re.search(r"\[Intent\]:\s*(.*)", action_text, re.IGNORECASE)
+        target_match = re.search(r"\[Target\]:\s*(.*)", action_text, re.IGNORECASE)
+        message_match = re.search(r"\[Message\]:\s*(.*)", action_text, re.IGNORECASE | re.DOTALL) # DOTALL for multi-line messages
+
+        if intent_match:
+            intent = intent_match.group(1).strip()
+        if target_match:
+            target = target_match.group(1).strip()
+        if message_match:
+            message = message_match.group(1).strip()
+
+        # Basic validation
+        valid_intents = ["Propose a deal", "Respond", "Comment", "Build alliances",
+                         "Request assistance", "Raise a global concern", "Decline to act"]
+        if intent not in valid_intents:
+             print(f"Warning: Invalid intent parsed: '{intent}'")
+             # Optionally default to 'Decline to act' or handle as error
+             # intent = "Decline to act" # Example fallback
+
+        return intent, target, message
+
     except Exception as e:
-        st.error(f"Groq API Error during message generation: {e}", icon="⚡")
-        print(f"Groq Error Details: {e}") # Log details for debugging
-        return f"(Error: Could not generate message for {speaker} to {receiver})"
+        print(f"Error parsing action text: {e}\nRaw text: {action_text}")
+        return None, None, None
 
-def determine_outcome(speaker, receiver, proposal, negotiation_style, metrics):
-    # Base probability influenced by peace index
-    base_prob = 0.2 + (metrics["Peace Index"] * 0.4)
 
-    # Adjust based on negotiation style
-    if negotiation_style == "Cooperative":
-        base_prob += 0.15
-    elif negotiation_style == "Competitive":
-        base_prob -= 0.10
-    # Mixed style has no direct base adjustment
+def determine_action_impact(agent_name, intent, target, message, metrics, all_nations):
+    """
+    Determines the outcome/impact of an agent's action on metrics and relationships.
+    Replaces the old 'determine_outcome' which was proposal-based.
 
-    # Check alignment with receiver's interests (simple keyword check)
-    receiver_interests = COUNTRY_PROFILES.get(receiver, {}).get("interests", [])
-    interest_match_score = 0
-    proposal_lower = proposal.lower() if proposal else "" # Handle potential None proposal
-    if proposal_lower:
-        for interest in receiver_interests:
-            # Basic check, could be enhanced with NLP
-            if interest.lower().split(' ')[0] in proposal_lower: # Check first word of interest
-                 interest_match_score += 0.05
-    base_prob += min(interest_match_score, 0.15) # Cap bonus from interest match
+    Args:
+        agent_name (str): The name of the agent taking the action.
+        intent (str): The parsed intent of the action.
+        target (str): The parsed target of the action ('GLOBAL' or a country name).
+        message (str): The message content (can be used for more nuanced impact later).
+        metrics (dict): The current global metrics.
+        all_nations (list): List of all participating nations.
 
-    # Add randomness
-    base_prob += random.uniform(-0.1, 0.1)
+    Returns:
+        tuple: (impact_description (str), relationship_change (float), target_for_relation_change (str or None))
+               Relationship change is applied between agent_name and target_for_relation_change.
+    """
+    impact_description = "Action noted."
+    relationship_change = 0.0
+    target_for_relation_change = None # Who the relationship change applies to
 
-    # Clamp probability between 5% and 95%
-    acceptance_prob = max(0.05, min(0.95, base_prob))
-
-    # Determine outcome
-    if random.random() < acceptance_prob:
-        return "Accepted ✅", "The proposal aligns sufficiently with mutual or national interests at this time."
-    else:
-        # Provide more context-specific rejection reasons
-        reasons = [
-            f"Insufficient alignment with {receiver}'s core interests.",
-            "Proposal viewed as unbalanced or lacking reciprocity.",
-            f"Domestic political constraints in {receiver} prevent acceptance.",
-            "Requires further clarification or concessions.",
-            f"Trust levels between {speaker} and {receiver} remain too low.",
-            "Waiting for a more opportune moment or a better offer."
-        ]
-        if negotiation_style == "Competitive":
-            reasons.append(f"{receiver} perceives the proposal as an attempt to gain unilateral advantage.")
-        if metrics["Peace Index"] < 0.4:
-             reasons.append("High global tension makes new commitments risky.")
-        # Add a reason if the proposal was empty/error
-        if not proposal_lower:
-            reasons.append("Proposal was unclear or missing.")
-
-        return "Rejected ❌", random.choice(reasons)
-
-def update_metrics(metrics, outcome, scenario):
-    # Get current state safely
+    # Default peace change based on intent severity
+    peace_index = metrics.get("Peace Index", 0.5)
     severity_factor = st.session_state.get('crisis_severity', 5) / 10.0
-    peace_index = metrics.get("Peace Index", 0.5) # Default if missing
-
-    # Update Peace Index
     peace_change = 0
-    if outcome == "Accepted ✅":
-        # Increase peace more if already low, less if high; reduced by severity
-        peace_change = random.uniform(0.01, 0.04) * (1.2 - peace_index) * (1.1 - severity_factor)
-    else: # Rejected
-        # Decrease peace more if already high, less if low; amplified by severity
-        peace_change = -random.uniform(0.01, 0.03) * (0.8 + peace_index) * (1 + severity_factor)
+
+    # Determine target for relationship changes
+    if target and target != "GLOBAL" and target in all_nations:
+        target_for_relation_change = target
+
+    # --- Impact based on Intent ---
+    if intent == "Propose a deal":
+        # Deals generally positive if targeted, slightly positive globally
+        impact_description = f"{agent_name} proposed a deal to {target}."
+        peace_change = random.uniform(0.005, 0.015) * (1.1 - peace_index) # Small positive global effect
+        if target_for_relation_change:
+            relationship_change = random.uniform(0.05, 0.15) # Positive relationship effect
+            impact_description += " Potential for mutual benefit."
+        else: # Global deal proposal? Less impactful directly.
+             impact_description += " Global cooperation suggested."
+
+    elif intent == "Respond":
+        # Response impact depends heavily on context (not fully modeled here yet)
+        # Assume neutral-to-slightly positive/negative for now
+        impact_description = f"{agent_name} responded regarding {target}."
+        peace_change = random.uniform(-0.01, 0.01) # Can go either way slightly
+        if target_for_relation_change:
+            # Could analyze message sentiment later, for now small random change
+            relationship_change = random.uniform(-0.05, 0.05)
+            impact_description += " Dialogue continues."
+
+    elif intent == "Comment":
+        # Comments are generally neutral unless inflammatory (not modeled)
+        impact_description = f"{agent_name} commented on the situation regarding {target}."
+        peace_change = random.uniform(-0.005, 0.005) # Very minor effect
+        # No direct relationship change unless comment is very targeted/harsh (future enhancement)
+
+    elif intent == "Build alliances":
+        # Alliances are positive for involved parties and slightly globally
+        impact_description = f"{agent_name} seeks to build an alliance with {target}."
+        peace_change = random.uniform(0.01, 0.02) * (1.1 - peace_index)
+        if target_for_relation_change:
+            relationship_change = random.uniform(0.1, 0.2) # Strong positive relationship effect
+            impact_description += " Strengthening ties."
+        else: # Global call for alliances?
+             impact_description += " Promoting general cooperation."
+
+
+    elif intent == "Request assistance":
+        # Requesting help can slightly decrease peace (sign of weakness/need), but builds relation if granted (not modeled yet)
+        impact_description = f"{agent_name} requested assistance from {target}."
+        peace_change = random.uniform(-0.015, -0.005) * (1 + severity_factor) # Negative global effect (indicates strain)
+        if target_for_relation_change:
+            # Request itself doesn't guarantee positive relation, maybe slightly negative initially?
+             relationship_change = random.uniform(-0.05, 0.02)
+             impact_description += " Seeking support."
+        else: # Global request for aid
+             impact_description += " Highlighting global need."
+
+
+    elif intent == "Raise a global concern":
+        # Raising concerns can increase tension slightly but is necessary
+        impact_description = f"{agent_name} raised a global concern."
+        peace_change = random.uniform(-0.02, 0.005) * (1 + severity_factor) # Can slightly decrease peace by highlighting problems
+        # No direct relationship change unless the concern implicitly blames someone
+
+    elif intent == "Decline to act":
+        # No action, neutral impact
+        impact_description = f"{agent_name} chose to observe this turn."
+        peace_change = 0
+        relationship_change = 0
+
+    else: # Unknown intent
+        impact_description = f"{agent_name} took an unrecognized action ({intent})."
+        peace_change = random.uniform(-0.01, 0.01)
+
+    # --- Update Metrics ---
+    # Apply peace change
     metrics["Peace Index"] = max(0.05, min(0.95, peace_index + peace_change))
 
-    # Scenario-specific updates (using .get for safety)
-    if "Climate" in scenario and "Carbon Emissions (Gt)" in metrics:
-        # Emissions tend to rise with low peace, decrease slightly with agreements
-        emission_change = random.uniform(-0.1, 0.5) + (0.6 - peace_index) * 0.4 - (0.1 if outcome == "Accepted ✅" else -0.05)
-        metrics["Carbon Emissions (Gt)"] = max(10, metrics.get("Carbon Emissions (Gt)", 35) + emission_change)
+    # Apply secondary metric effects based on the general trend (similar to before)
+    # These could be made more sensitive to specific intents/messages later
+    current_peace = metrics["Peace Index"] # Use updated peace
 
-    elif "Energy" in scenario and "Energy Stability Index" in metrics:
-        # Stability improves with peace/agreements, degrades otherwise
-        stability_change = (peace_index - 0.5) * 0.05 + random.uniform(-0.03, 0.03) + (0.03 if outcome == "Accepted ✅" else -0.04)
+    if "Climate" in st.session_state.selected_scenario and "Carbon Emissions (Gt)" in metrics:
+        emission_change = random.uniform(-0.05, 0.3) + (0.55 - current_peace) * 0.3
+        # Small bonus for deals/alliances, penalty for concerns/requests
+        if intent in ["Propose a deal", "Build alliances"]: emission_change -= 0.05
+        if intent in ["Raise a global concern", "Request assistance"]: emission_change += 0.05
+        metrics["Carbon Emissions (Gt)"] = max(10, metrics.get("Carbon Emissions (Gt)", 35.0) + emission_change)
+
+    elif "Energy" in st.session_state.selected_scenario and "Energy Stability Index" in metrics:
+        stability_change = (current_peace - 0.5) * 0.04 + random.uniform(-0.02, 0.02)
+        if intent in ["Propose a deal", "Build alliances"]: stability_change += 0.02
+        if intent in ["Raise a global concern", "Request assistance"]: stability_change -= 0.02
         metrics["Energy Stability Index"] = max(0.1, min(0.9, metrics.get("Energy Stability Index", 0.6) + stability_change))
 
-    elif "Refugee" in scenario and "Refugee Migration (M)" in metrics:
-        # Refugees decrease with agreements (more if peace is high), increase otherwise
-         if outcome == "Accepted ✅":
-             decrease = random.randint(1, 3) * (1 + int(peace_index > 0.6))
+    elif "Refugee" in st.session_state.selected_scenario and "Refugee Migration (M)" in metrics:
+         if intent in ["Propose a deal", "Build alliances"]: # Actions that might stabilize
+             decrease = random.randint(0, 2) * (1 + int(current_peace > 0.6))
              metrics["Refugee Migration (M)"] = max(0, metrics.get("Refugee Migration (M)", 20) - decrease)
+         elif intent in ["Raise a global concern", "Request assistance"]: # Actions indicating instability
+             increase = random.randint(0, 1) * (1 + int(current_peace < 0.4))
+             metrics["Refugee Migration (M)"] = max(0, metrics.get("Refugee Migration (M)", 20) + increase)
+         # Otherwise small random fluctuation
          else:
-             # Slight random increase on rejection
-             metrics["Refugee Migration (M)"] = max(0, metrics.get("Refugee Migration (M)", 20) + random.randint(0, 1))
+              metrics["Refugee Migration (M)"] = max(0, metrics.get("Refugee Migration (M)", 20) + random.randint(-1, 1))
 
-    # Economic Growth Update
+
     if "Economic Growth (%)" in metrics:
-        # Growth hurt by low peace & severity, helped slightly by agreements
-        base_growth_factor = (peace_index - 0.55) * 0.3 - severity_factor * 0.15
-        outcome_impact = 0.06 if outcome == "Accepted ✅" else -0.04
-        random_fluct = random.uniform(-0.1, 0.1)
+        base_growth_factor = (current_peace - 0.55) * 0.25 - severity_factor * 0.1
+        intent_impact = 0
+        if intent in ["Propose a deal", "Build alliances"]: intent_impact = 0.05
+        if intent in ["Raise a global concern", "Request assistance"]: intent_impact = -0.03
+        random_fluct = random.uniform(-0.08, 0.08)
         current_growth = metrics.get("Economic Growth (%)", 2.5)
-        metrics["Economic Growth (%)"] = round(max(-15.0, current_growth + base_growth_factor + outcome_impact + random_fluct), 1)
+        metrics["Economic Growth (%)"] = round(max(-15.0, current_growth + base_growth_factor + intent_impact + random_fluct), 1)
 
-    # Ensure default values if keys were somehow missing (less likely now)
-    metrics.setdefault("Carbon Emissions (Gt)", 35.0) # Ensure float
+    # Ensure default values remain if keys were missing
+    metrics.setdefault("Carbon Emissions (Gt)", 35.0)
     metrics.setdefault("Refugee Migration (M)", 20)
-    metrics.setdefault("Energy Stability Index", 0.6) # Ensure float
-    metrics.setdefault("Economic Growth (%)", 2.5) # Ensure float
+    metrics.setdefault("Energy Stability Index", 0.6)
+    metrics.setdefault("Economic Growth (%)", 2.5)
 
-    return metrics
+    return impact_description, relationship_change, target_for_relation_change
+
 
 def generate_country_card(country):
+    """ Generates an HTML card for a country's profile. """
     profile = COUNTRY_PROFILES.get(country)
     if not profile:
         return "<p><em>Profile not available.</em></p>"
 
-    # Simple HTML card for country profile (keeping this as it's simple)
     card = f"""
     <div style='padding: 1rem; margin-bottom: 1rem; border-radius: 8px;
                 background-color: #ffffff; border-left: 5px solid {profile.get("color", "#cccccc")};
@@ -330,7 +526,7 @@ def generate_country_card(country):
     return card
 
 # --- UI Layout ---
-st.title("🌐 PoliBot Pro: Advanced Crisis Negotiation Simulator")
+st.title("🌐 PoliBot Agents: Advanced Crisis Negotiation Simulator")
 
 col_main, col_sidebar = st.columns([3, 1]) # Main content area wider
 
@@ -340,16 +536,14 @@ with col_sidebar:
     # --- Scenario Selection ---
     if 'selected_scenario' not in st.session_state:
         st.session_state.selected_scenario = list(SCENARIO_DETAILS.keys())[0]
-    # Use the current state value in selectbox, update state on change
     st.session_state.selected_scenario = st.selectbox(
         "🌍 Crisis Scenario",
         options=list(SCENARIO_DETAILS.keys()),
         index=list(SCENARIO_DETAILS.keys()).index(st.session_state.selected_scenario),
-        key="scenario_select" # Key helps maintain state across reruns
+        key="scenario_select"
     )
-    scenario = st.session_state.selected_scenario # Get current value
+    scenario = st.session_state.selected_scenario
 
-    # Display scenario details in an expander
     with st.expander("Scenario Details", expanded=False):
         details = SCENARIO_DETAILS[scenario]
         st.write(f"**Description:** {details['description']}")
@@ -357,88 +551,67 @@ with col_sidebar:
         st.write(f"**Historical Context:** {details['historical']}")
 
     # --- Nation Selection ---
+    available_nations = sorted(list(COUNTRY_PROFILES.keys())) # Ensure consistent order
     if 'selected_nations' not in st.session_state:
-        # Default selection
-        st.session_state.selected_nations = ["USA", "China", "India", "Germany"]
-    # Use current state value in multiselect, update state on change
+        st.session_state.selected_nations = ["USA", "China", "India", "EU", "Pakistan"] # Updated default
     st.session_state.selected_nations = st.multiselect(
         "🌎 Participating Nations",
-        options=list(COUNTRY_PROFILES.keys()),
+        options=available_nations,
         default=st.session_state.selected_nations,
-        key="nation_select" # Key for state persistence
+        key="nation_select"
     )
-    nations = st.session_state.selected_nations # Get current value
+    nations = st.session_state.selected_nations
 
     # --- Simulation Speed Slider ---
     if 'sim_speed' not in st.session_state:
-        st.session_state.sim_speed = 1.0 # Default speed
-    # Ensure sim_speed is float before passing to slider
-    current_speed = st.session_state.get('sim_speed', 1.0)
+        st.session_state.sim_speed = 0.5 # Default speed (faster for agent turns)
+    current_speed = st.session_state.get('sim_speed', 0.5)
     if not isinstance(current_speed, (int, float)):
-        st.warning("Resetting simulation speed due to invalid type.", icon="⚠️")
-        current_speed = 1.0
+        current_speed = 0.5
         st.session_state.sim_speed = current_speed
-    # Update state based on slider interaction
     st.session_state.sim_speed = st.slider(
-        "⏱️ Simulation Speed (s/turn)",
-        min_value=0.0, max_value=5.0,
-        value=float(current_speed), # Pass current valid float value
+        "⏱️ Delay Per Agent Action (s)", # Changed label
+        min_value=0.0, max_value=3.0, # Reduced max speed
+        value=float(current_speed),
         step=0.1,
-        key="speed_slider" # Key for state
+        key="speed_slider"
     )
-    speed = st.session_state.sim_speed # Get current value
+    speed = st.session_state.sim_speed
 
     # --- Number of Turns ---
     if 'num_turns' not in st.session_state:
-        st.session_state.num_turns = 15 # Default turns
-    # Update state based on number input
+        st.session_state.num_turns = 10 # Reduced default turns as each turn has more actions
     st.session_state.num_turns = st.number_input(
         "🔄 Number of Turns",
-        min_value=5, max_value=50,
+        min_value=3, max_value=30, # Adjusted range
         value=st.session_state.num_turns,
         step=1,
-        key="turns_input" # Key for state
+        key="turns_input"
     )
-    num_turns = st.session_state.num_turns # Get current value
+    num_turns = st.session_state.num_turns
 
-    # --- Negotiation Style ---
+    # --- Negotiation Style (Kept for potential future use in prompt nuances) ---
     style_options = ["Cooperative", "Competitive", "Mixed"]
     if 'negotiation_style' not in st.session_state or st.session_state.negotiation_style not in style_options:
-        st.session_state.negotiation_style = "Mixed" # Default/fallback
-    # Update state based on radio button selection
+        st.session_state.negotiation_style = "Mixed"
     st.session_state.negotiation_style = st.radio(
-        "🗣️ Overall Negotiation Style",
+        "🗣️ Agent Behavior Hint (Subtle Influence)", # Renamed
         options=style_options,
         index=style_options.index(st.session_state.negotiation_style),
-        key="style_radio" # Key for state
+        key="style_radio",
+        help="Provides a subtle hint to agents, but their core interests dominate."
     )
-    negotiation_style = st.session_state.negotiation_style # Get current value
+    negotiation_style = st.session_state.negotiation_style
 
     # --- Advanced Options ---
-    # Initialize state variables if they don't exist
-    if 'advanced_options_checked' not in st.session_state:
-        st.session_state.advanced_options_checked = False
-    if 'crisis_severity' not in st.session_state:
-        st.session_state.crisis_severity = 5
-    if 'initial_peace' not in st.session_state:
-        st.session_state.initial_peace = 0.5
+    if 'advanced_options_checked' not in st.session_state: st.session_state.advanced_options_checked = False
+    if 'crisis_severity' not in st.session_state: st.session_state.crisis_severity = 5
+    if 'initial_peace' not in st.session_state: st.session_state.initial_peace = 0.5
 
-    # Checkbox to show/hide advanced options
-    st.session_state.advanced_options_checked = st.checkbox(
-        "Show Advanced Options",
-        value=st.session_state.advanced_options_checked,
-        key="advanced_checkbox" # Key for state
-        )
-    # Display sliders if checkbox is checked
+    st.session_state.advanced_options_checked = st.checkbox("Show Advanced Options", value=st.session_state.advanced_options_checked, key="advanced_checkbox")
     if st.session_state.advanced_options_checked:
-        st.session_state.crisis_severity = st.slider(
-            "🔥 Crisis Severity", 1, 10, st.session_state.crisis_severity,
-            key="severity_slider" # Key for state
-            )
-        st.session_state.initial_peace = st.slider(
-            "🕊️ Initial Peace Index", 0.1, 0.9, st.session_state.initial_peace, 0.05,
-            key="peace_slider" # Key for state
-            )
+        st.session_state.crisis_severity = st.slider("🔥 Crisis Severity", 1, 10, st.session_state.crisis_severity, key="severity_slider")
+        st.session_state.initial_peace = st.slider("🕊️ Initial Peace Index", 0.1, 0.9, st.session_state.initial_peace, 0.05, key="peace_slider")
 
     # --- Start Button ---
     start_simulation = st.button("🚀 Start Simulation", type="primary", use_container_width=True, key="start_button")
@@ -447,8 +620,8 @@ with col_sidebar:
     st.markdown("---")
     st.markdown("### Selected Country Profiles")
     if nations:
-        for country in nations:
-            # Display profile card for each selected nation
+        # Sort nations alphabetically for consistent display order
+        for country in sorted(nations):
             st.markdown(generate_country_card(country), unsafe_allow_html=True)
     else:
         st.warning("Please select at least two nations.")
@@ -459,95 +632,75 @@ with col_main:
     st.subheader("📊 Global Metrics Dashboard")
 
     # --- Initialize Metrics State ---
-    # Reset metrics only if the start button is pressed OR if they don't exist yet
     if 'metrics' not in st.session_state or start_simulation:
-        # Use advanced options if checked, otherwise defaults
         init_peace = st.session_state.initial_peace if st.session_state.advanced_options_checked else 0.5
-        # Store the initial state separately for comparison
         st.session_state.metrics_initial = {
-            "Peace Index": init_peace,
-            "Carbon Emissions (Gt)": 35.0, # Use float
-            "Refugee Migration (M)": 20, # Use int
-            "Energy Stability Index": 0.6, # Use float
-            "Economic Growth (%)": 2.5 # Use float
+            "Peace Index": init_peace, "Carbon Emissions (Gt)": 35.0,
+            "Refugee Migration (M)": 20, "Energy Stability Index": 0.6,
+            "Economic Growth (%)": 2.5
         }
-        # Copy initial state to the current metrics state
         st.session_state.metrics = st.session_state.metrics_initial.copy()
 
     # --- Metric Display Area ---
     metrics_container = st.container()
-    # Get keys safely, providing an empty dict if 'metrics' doesn't exist
     metric_keys = list(st.session_state.get('metrics', {}).keys())
     metrics_placeholders = {}
     num_metrics = len(metric_keys)
-    cols_per_row = 4 # Adjust layout as needed
+    cols_per_row = 4
     num_rows = (num_metrics + cols_per_row - 1) // cols_per_row
 
     with metrics_container:
-        # Create placeholders in columns dynamically
         placeholder_rows = [st.columns(cols_per_row) for _ in range(num_rows)]
-        # Assign placeholders to keys
         for i, key in enumerate(metric_keys):
             row_index = i // cols_per_row
             col_index = i % cols_per_row
-            # Assign the empty placeholder from the correct column
             metrics_placeholders[key] = placeholder_rows[row_index][col_index].empty()
 
     # Function to update the metric display placeholders
     def display_metrics(metrics_data):
-        # Safely get initial metrics, default to current if initial is missing
         initial_metrics = st.session_state.get('metrics_initial', metrics_data)
-
-        # Helper to safely get values and calculate deltas
         def get_metric_values(key, current_data, initial_data, default=0):
             current_val = current_data.get(key, default)
             initial_val = initial_data.get(key, default)
-            # Ensure consistent types for subtraction
-            try:
-                delta = float(current_val) - float(initial_val)
-            except (ValueError, TypeError):
-                delta = 0 # Handle cases where conversion fails
+            try: delta = float(current_val) - float(initial_val)
+            except (ValueError, TypeError): delta = 0
             return current_val, delta
 
-        # Update each metric placeholder if it exists
         if "Peace Index" in metrics_placeholders:
              val, delta = get_metric_values("Peace Index", metrics_data, initial_metrics, 0.5)
-             metrics_placeholders["Peace Index"].metric("🕊️ Peace Index", f"{val:.2f}", f"{delta:+.2f}",
-                                                        delta_color="normal" if delta >= -0.001 else "inverse")
+             metrics_placeholders["Peace Index"].metric("🕊️ Peace Index", f"{val:.2f}", f"{delta:+.2f}", delta_color="normal" if delta >= -0.001 else "inverse")
         if "Carbon Emissions (Gt)" in metrics_placeholders:
             val, delta = get_metric_values("Carbon Emissions (Gt)", metrics_data, initial_metrics, 35.0)
-            metrics_placeholders["Carbon Emissions (Gt)"].metric("💨 CO₂ Emissions (Gt)", f"{val:.1f}", f"{delta:+.1f}", delta_color="inverse") # Higher is worse
+            metrics_placeholders["Carbon Emissions (Gt)"].metric("💨 CO₂ Emissions (Gt)", f"{val:.1f}", f"{delta:+.1f}", delta_color="inverse")
         if "Refugee Migration (M)" in metrics_placeholders:
             val, delta = get_metric_values("Refugee Migration (M)", metrics_data, initial_metrics, 20)
-            metrics_placeholders["Refugee Migration (M)"].metric("🚶 Refugees (M)", f"{int(val):,}", f"{int(delta):+,}", delta_color="inverse") # Higher is worse
+            metrics_placeholders["Refugee Migration (M)"].metric("🚶 Refugees (M)", f"{int(val):,}", f"{int(delta):+,}", delta_color="inverse")
         if "Energy Stability Index" in metrics_placeholders:
              val, delta = get_metric_values("Energy Stability Index", metrics_data, initial_metrics, 0.6)
-             metrics_placeholders["Energy Stability Index"].metric("⚡ Energy Stability", f"{val:.2f}", f"{delta:+.2f}",
-                                                                    delta_color="normal" if delta >= -0.001 else "inverse")
+             metrics_placeholders["Energy Stability Index"].metric("⚡ Energy Stability", f"{val:.2f}", f"{delta:+.2f}", delta_color="normal" if delta >= -0.001 else "inverse")
         if "Economic Growth (%)" in metrics_placeholders:
             val, delta = get_metric_values("Economic Growth (%)", metrics_data, initial_metrics, 2.5)
-            metrics_placeholders["Economic Growth (%)"].metric("📈 Econ Growth (%)", f"{val:.1f}%", f"{delta:+.1f}%",
-                                                                delta_color="normal" if delta >= -0.001 else "inverse")
+            metrics_placeholders["Economic Growth (%)"].metric("📈 Econ Growth (%)", f"{val:.1f}%", f"{delta:+.1f}%", delta_color="normal" if delta >= -0.001 else "inverse")
 
-    # Initial display of metrics when script runs
-    display_metrics(st.session_state.get('metrics', {})) # Use .get for safety
+    # Initial display
+    display_metrics(st.session_state.get('metrics', {}))
 
-    # Placeholders for dynamic updates during simulation
+    # Placeholders
     progress_bar_placeholder = st.empty()
-    status_text_placeholder = st.empty() # For showing turn status message
+    status_text_placeholder = st.empty()
 
     # --- Main Content Areas ---
     st.markdown("---")
-    st.subheader("🗣️ Negotiation Log")
-    # Use a container with a fixed height and scrollbar for the log
-    negotiation_log_container = st.container(height=300) # Adjust height as needed
+    st.subheader("🗣️ Agent Action Log") # Renamed
+    negotiation_log_container = st.container(height=400) # Increased height
     negotiation_log_container.markdown("_(Simulation log will appear here...)_", unsafe_allow_html=True)
 
+    # Treaties are less direct now, maybe rename or repurpose?
+    # Keeping for now, could log successful 'Propose a deal' or 'Build alliance' actions here
     st.markdown("---")
-    st.subheader("📜 Signed Treaties & Agreements")
-    # Use a container with a fixed height and scrollbar for treaties
-    treaty_container = st.container(height=300) # Adjust height as needed
-    treaty_container.markdown("_(Signed agreements will appear here...)_", unsafe_allow_html=True)
+    st.subheader("📜 Significant Agreements & Actions")
+    treaty_container = st.container(height=250) # Adjusted height
+    treaty_container.markdown("_(Notable agreements or alliance formations will appear here...)_", unsafe_allow_html=True)
 
     st.markdown("---")
     st.subheader("🌐 Diplomatic Network")
@@ -556,205 +709,200 @@ with col_main:
 
     st.markdown("---")
     st.subheader("📄 Simulation Analytics")
-    # This placeholder will be filled with Streamlit elements at the end
-    report_placeholder = st.container() # Use a container
-    report_placeholder.markdown("_(Summary report will appear here after simulation...)_") # Initial text
+    report_placeholder = st.container()
+    report_placeholder.markdown("_(Summary report will appear here after simulation...)_")
 
     # --- Initialize Simulation State Lists ---
-    # Initialize only if they don't exist in the session state
-    if 'simulation_dialogue' not in st.session_state:
-        st.session_state.simulation_dialogue = []
-    if 'simulation_treaties' not in st.session_state:
-        st.session_state.simulation_treaties = []
-    if 'simulation_relationships' not in st.session_state:
-        st.session_state.simulation_relationships = {}
-    if 'simulation_graph' not in st.session_state:
-         st.session_state.simulation_graph = nx.Graph()
+    if 'simulation_log' not in st.session_state: st.session_state.simulation_log = [] # Renamed from dialogue
+    if 'simulation_agreements' not in st.session_state: st.session_state.simulation_agreements = [] # Renamed from treaties
+    if 'simulation_relationships' not in st.session_state: st.session_state.simulation_relationships = {}
+    if 'simulation_graph' not in st.session_state: st.session_state.simulation_graph = nx.Graph()
+    if 'agents' not in st.session_state: st.session_state.agents = {} # To store agent objects
 
 
 # --- Simulation Logic ---
 if start_simulation:
-    # Validate nation selection
     if len(nations) < 2:
         st.error("❌ Please select at least two nations to run the simulation.")
     else:
-        # --- Reset and Initialize State for a New Simulation ---
-        # Clearing the dialogue and treaties lists to prevent duplicates between runs
-        st.session_state.simulation_dialogue = []
-        st.session_state.simulation_treaties = []
-        # Reset metrics to the initial state defined earlier
+        # --- Reset and Initialize State ---
+        st.session_state.simulation_log = []
+        st.session_state.simulation_agreements = []
         st.session_state.metrics = st.session_state.metrics_initial.copy()
-        display_metrics(st.session_state.metrics) # Update dashboard to initial state
+        display_metrics(st.session_state.metrics)
 
-        # Clear dynamic content areas visually
         negotiation_log_container.empty().markdown("_(Simulation running...)_", unsafe_allow_html=True)
         treaty_container.empty().markdown("_(Simulation running...)_", unsafe_allow_html=True)
         graph_placeholder.empty().markdown("_(Simulation running...)_", unsafe_allow_html=True)
-        report_placeholder.empty().markdown("_(Simulation running...)_") # Clear report area
+        report_placeholder.empty().markdown("_(Simulation running...)_")
         status_text_placeholder.empty()
 
-        # Initialize graph and relationships for this run
+        # --- Create Agents ---
+        agents = {name: CountryAgent(name, COUNTRY_PROFILES[name], groq_client) for name in nations}
+        st.session_state.agents = agents # Store agents in session state
+
+        # Initialize graph and relationships
         G = nx.Graph()
         G.add_nodes_from(nations)
-        st.session_state.simulation_graph = G # Store graph in state
-        # Initialize relationships with 0 (neutral)
+        st.session_state.simulation_graph = G
+        # Initialize relationships with 0.0 (neutral)
         relationships = {n: {m: 0.0 for m in nations if m != n} for n in nations}
-        st.session_state.simulation_relationships = relationships
+        st.session_state.simulation_relationships = relationships # Store initial relationships
 
-        # Setup progress bar and status text
         progress_bar = progress_bar_placeholder.progress(0, text="Simulation Starting...")
         status_text = status_text_placeholder.text("Initializing Simulation...")
 
         # --- Simulation Loop ---
         try:
-            metrics = st.session_state.metrics # Local reference for updates
+            metrics = st.session_state.metrics # Local reference
 
             for turn in range(1, num_turns + 1):
                 status_text.text(f"Processing Turn {turn}/{num_turns}...")
+                # Update progress bar based on turns
                 progress = int((turn / num_turns) * 100)
                 progress_bar.progress(progress, text=f"Simulation Progress: Turn {turn}/{num_turns}")
 
-                # Select two distinct nations randomly for interaction
-                speaker, receiver = random.sample(nations, 2)
+                # Shuffle agent order each turn for fairness
+                agent_order = random.sample(list(agents.keys()), len(agents))
 
-                # Get recent dialogue for context (only text part)
-                # Using list slicing [::-1][:3] to get the last 3 elements in reverse order
-                # which is equivalent to the first 3 if prepended. Reversing before slicing
-                # is safer to get the *most recent* interactions.
-                context_log = [
-                    entry.split("<em>Proposal:</em>")[1].split("<br>")[0].replace('"', '').strip()
-                    for entry in st.session_state.simulation_dialogue[::-1][:3] # Get the text from the 3 most recent logs
-                    if isinstance(entry, str) and "<em>Proposal:</em>" in entry
-                ]
-                # Reverse the context_log back to chronological order for LLM
-                context_log.reverse()
+                turn_actions = [] # Collect actions within this turn before logging memory
+
+                # --- Agent Action Phase ---
+                for agent_name in agent_order:
+                    agent = agents[agent_name]
+                    status_text.text(f"Turn {turn}/{num_turns} - {agent_name}'s Action...")
+
+                    # Agent decides action
+                    action_raw = agent.act(scenario, SCENARIO_DETAILS[scenario], turn, nations)
+
+                    # Parse the action
+                    intent, target, message = parse_action(action_raw)
+
+                    if not intent or not target or not message:
+                         # Handle parsing failure (already printed warning in parse_action)
+                         intent, target, message = "Decline to act", "GLOBAL", "(Parsing Error)" # Fallback
+
+                    # Determine impact of the action
+                    impact_desc, rel_change, rel_target = determine_action_impact(
+                        agent_name, intent, target, message, metrics, nations
+                    )
+
+                    # Update global metrics (already updated inside determine_action_impact)
+                    st.session_state.metrics = metrics # Save updated metrics back to state
+                    display_metrics(metrics) # Update dashboard display
+
+                    # Log the action for this turn
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    # Add CSS class based on intent for styling
+                    intent_class = f"intent-{intent.lower().replace(' ', '-')}"
+                    log_entry_html = f"""
+                    <div class="log-entry {intent_class}">
+                        <strong>Turn {turn} • {timestamp} • {agent_name}</strong><br>
+                        <strong>Intent:</strong> {intent} | <strong>Target:</strong> {target}<br>
+                        <strong>Message:</strong> "{message}"<br>
+                        <em>Impact: {impact_desc}</em>
+                    </div>
+                    """
+                    # Prepend to main log list
+                    st.session_state.simulation_log.insert(0, log_entry_html)
+                    # Store plain text version for agent memory
+                    plain_log_for_memory = f"Turn {turn}: {agent_name} - Intent: {intent}, Target: {target}, Msg: '{message}', Impact: {impact_desc}"
+                    turn_actions.append((agent_name, plain_log_for_memory)) # Store who took action and the log
+
+                    # Update relationships and graph edge
+                    if rel_target and rel_target != agent_name: # Ensure target is valid and not self
+                        # Get current weight safely
+                        current_weight = G.get_edge_data(agent_name, rel_target, default={'weight': 0.0})['weight']
+                        # Apply change and clamp
+                        new_weight = max(-1.0, min(1.0, current_weight + rel_change))
+                        G.add_edge(agent_name, rel_target, weight=new_weight)
+                        # Update relationship dictionary as well (optional, graph holds the state)
+                        st.session_state.simulation_relationships[agent_name][rel_target] = new_weight
+                        st.session_state.simulation_relationships[rel_target][agent_name] = new_weight
 
 
-                # Generate the diplomatic proposal message
-                proposal = generate_negotiation_message(
-                    speaker, receiver, scenario, negotiation_style, turn, context_log
-                )
+                    # Log significant agreements/alliances
+                    if intent in ["Propose a deal", "Build alliances"] and rel_target:
+                        agreement_log = (agent_name, rel_target, turn, intent, message)
+                        st.session_state.simulation_agreements.insert(0, agreement_log)
 
-                # Determine the outcome of the proposal
-                outcome, reason = determine_outcome(
-                    speaker, receiver, proposal, negotiation_style, metrics
-                )
+                    # --- Update UI (Log & Agreements) ---
+                    with negotiation_log_container:
+                        negotiation_log_container.empty()
+                        log_display_html = "".join(st.session_state.simulation_log[:15]) # Show more entries
+                        st.markdown(log_display_html, unsafe_allow_html=True)
 
-                # Update global metrics based on the outcome
-                metrics = update_metrics(metrics, outcome, scenario)
-                st.session_state.metrics = metrics # Save updated metrics back to state
-                display_metrics(metrics) # Update dashboard display
-
-                # Log the interaction
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                log_entry_html = f"""
-                <div class="log-entry">
-                    <strong>Turn {turn} • {timestamp}</strong> | <strong>{speaker} → {receiver}</strong><br>
-                    <em>Proposal:</em> "{proposal}"<br>
-                    <strong>Outcome: {outcome}</strong> <em>({reason})</em>
-                </div>
-                """
-                # Prepend new log entry to the list for newest-first display
-                st.session_state.simulation_dialogue.insert(0, log_entry_html)
-
-                # Update relationships and graph based on outcome
-                relationship_change = 0.0
-                current_weight = G.get_edge_data(speaker, receiver, default={'weight': 0.0})['weight']
-
-                if outcome == "Accepted ✅":
-                    relationship_change = 0.2 # Smaller increment for acceptance
-                    # Add treaty only if proposal is valid
-                    if proposal and not proposal.startswith("(Error:"):
-                        st.session_state.simulation_treaties.insert(0, (speaker, receiver, turn, proposal)) # Prepend
-                else: # Rejected
-                    relationship_change = -0.1 # Smaller decrement for rejection
-
-                # Update edge weight, clamping between -1.0 and +1.0
-                new_weight = max(-1.0, min(1.0, current_weight + relationship_change))
-                G.add_edge(speaker, receiver, weight=new_weight) # Updates or adds edge
-
-                # --- Update UI (Log & Treaties) ---
-                # Display the latest log entries (e.g., last 10)
-                with negotiation_log_container: # Use the container
-                    # Clear previous display
-                    negotiation_log_container.empty()
-                    # Join the first N entries (which are the newest)
-                    log_display_html = "".join(st.session_state.simulation_dialogue[:10])
-                    st.markdown(log_display_html, unsafe_allow_html=True)
-
-                # Display the latest treaties using Streamlit components
-                with treaty_container:
-                    # Clear the container before writing to avoid appending previous turn's display
-                    treaty_container.empty()
-                    if st.session_state.simulation_treaties:
-                        st.subheader("Recent Agreements")
-                        # Show newest 5 treaties
-                        for treaty in st.session_state.simulation_treaties[:5]:
-                            # Use st.info to display each treaty
-                            st.info(f"""
-**{treaty[0]} ↔ {treaty[1]}** (Turn {treaty[2]})
-
-Proposal: "{treaty[3]}"
+                    with treaty_container:
+                        treaty_container.empty()
+                        if st.session_state.simulation_agreements:
+                            st.markdown("##### Recent Agreements/Overtures") # Use markdown heading
+                            for agmt in st.session_state.simulation_agreements[:5]:
+                                st.info(f"""
+**{agmt[0]} → {agmt[1]}** (Turn {agmt[2]})
+Intent: **{agmt[3]}**
+Message: "{agmt[4]}"
 """)
+                        else:
+                            st.markdown("<em>No significant agreements logged yet.</em>", unsafe_allow_html=True)
+
+
+                    # --- Update Graph ---
+                    if G.number_of_nodes() > 0:
+                        plt.style.use('seaborn-v0_8-whitegrid')
+                        plt.figure(figsize=(10, 7))
+                        try: pos = nx.kamada_kawai_layout(G, weight='weight', scale=1.0) # Try weight-influenced layout
+                        except Exception: pos = nx.spring_layout(G, seed=42, k=0.9, iterations=50) # Fallback
+
+                        node_colors = [COUNTRY_PROFILES.get(n, {}).get("color", "#cccccc") for n in G.nodes()]
+                        node_sizes = [1200 + G.degree(n) * 250 for n in G.nodes()] # Adjusted size scaling
+
+                        edge_weights = [G[u][v].get('weight', 0) for u, v in G.edges()]
+                        max_abs_w = max(abs(w) for w in edge_weights) if edge_weights else 1.0
+                        max_abs_w = max(max_abs_w, 0.1)
+
+                        edge_widths = [1 + (abs(w) / max_abs_w * 4) for w in edge_weights]
+                        edge_colors = ['#2ca02c' if w > 0.1 else '#d62728' if w < -0.1 else '#aaaaaa' for w in edge_weights] # Threshold for color
+                        edge_alphas = [0.4 + (abs(w) / max_abs_w * 0.5) for w in edge_weights] # Adjusted alpha
+
+                        nx.draw_networkx_nodes(G, pos, node_size=node_sizes, node_color=node_colors, alpha=0.9, linewidths=1.0, edgecolors='grey')
+                        nx.draw_networkx_edges(G, pos, width=edge_widths, edge_color=edge_colors, alpha=edge_alphas, connectionstyle='arc3,rad=0.05')
+                        nx.draw_networkx_labels(G, pos, font_size=9, font_weight="bold", font_color='black')
+
+                        plt.title(f"Diplomatic Network (End of Turn {turn})", fontsize=16)
+                        plt.axis("off")
+                        plt.tight_layout()
+                        buf = io.BytesIO()
+                        plt.savefig(buf, format="png", dpi=130, bbox_inches='tight')
+                        graph_placeholder.image(buf)
+                        plt.close()
                     else:
-                        st.markdown("<em>No treaties signed yet.</em>", unsafe_allow_html=True)
+                        graph_placeholder.markdown("_(Graph requires nodes)_")
 
+                    # Pause between agent actions if speed > 0
+                    if speed > 0:
+                        time.sleep(speed)
 
-                # --- Update Graph ---
-                if G.number_of_nodes() > 0:
-                    plt.style.use('seaborn-v0_8-whitegrid') # Use a clean style
-                    plt.figure(figsize=(10, 7)) # Adjust figure size
-                    try:
-                        # Use a layout algorithm that handles weights if available and sensible
-                        pos = nx.kamada_kawai_layout(G, weight=None) # Kamada-Kawai often looks good
-                    except Exception:
-                        pos = nx.spring_layout(G, seed=42, k=0.8) # Fallback layout
+                # --- Memory Phase (End of Turn) ---
+                # Add all actions from this turn to relevant agents' memories
+                for acting_agent_name, log_for_memory in turn_actions:
+                     # Add to the acting agent's memory
+                     if acting_agent_name in agents:
+                         agents[acting_agent_name].remember(log_for_memory)
+                     # Potentially add to the target agent's memory as well if it was a direct interaction
+                     parsed_target = re.search(r"Target:\s*(\S+)", log_for_memory)
+                     if parsed_target:
+                         target_name = parsed_target.group(1)
+                         if target_name in agents and target_name != acting_agent_name:
+                             # Add a slightly modified log entry for the target
+                             memory_for_target = f"Turn {turn}: Received from {acting_agent_name} - Intent: {re.search(r'Intent:\s*(.*?),', log_for_memory).group(1)}, Msg: '{re.search(r'Msg:\s*\'(.*?)\'', log_for_memory).group(1)}'"
+                             agents[target_name].remember(memory_for_target)
 
-                    node_colors = [COUNTRY_PROFILES.get(n, {}).get("color", "#cccccc") for n in G.nodes()]
-                    # Node size based on degree (number of connections)
-                    node_sizes = [1000 + G.degree(n) * 300 for n in G.nodes()]
-
-                    # Edge properties based on weight
-                    edge_weights = [G[u][v].get('weight', 0) for u, v in G.edges()]
-                    # Normalize weights for width/color intensity (0 to 1 absolute)
-                    max_abs_w = max(abs(w) for w in edge_weights) if edge_weights else 1.0
-                    max_abs_w = max(max_abs_w, 0.1) # Avoid division by zero or tiny numbers
-
-                    # Width based on absolute weight magnitude
-                    edge_widths = [1 + (abs(w) / max_abs_w * 4) for w in edge_weights]
-                    # Color based on sign (positive=green, negative=red)
-                    edge_colors = ['#2ca02c' if w > 0 else '#d62728' if w < 0 else '#aaaaaa' for w in edge_weights]
-                    # Alpha based on absolute weight magnitude
-                    edge_alphas = [0.3 + (abs(w) / max_abs_w * 0.6) for w in edge_weights]
-
-
-                    # Draw nodes
-                    nx.draw_networkx_nodes( G, pos, node_size=node_sizes, node_color=node_colors, alpha=0.9, linewidths=1.0, edgecolors='grey')
-                    # Draw edges
-                    nx.draw_networkx_edges( G, pos, width=edge_widths, edge_color=edge_colors, alpha=edge_alphas, connectionstyle='arc3,rad=0.05') # Slight curve
-                    # Draw labels (without background box)
-                    nx.draw_networkx_labels( G, pos, font_size=9, font_weight="bold", font_color='black')
-
-                    plt.title(f"Diplomatic Network (Turn {turn})", fontsize=16)
-                    plt.axis("off") # Hide axes
-                    plt.tight_layout() # Adjust layout
-                    buf = io.BytesIO() # Save to buffer
-                    plt.savefig(buf, format="png", dpi=130, bbox_inches='tight')
-                    graph_placeholder.image(buf) # Display image from buffer
-                    plt.close() # Close plot to free memory
-                else:
-                    graph_placeholder.markdown("_(Graph cannot be drawn - no nations selected)_")
-
-                # Pause between turns if speed > 0
-                if speed > 0:
-                    time.sleep(speed)
 
             # --- Simulation End & Reporting ---
             status_text.text("Simulation Complete.")
             progress_bar.progress(100, text="Simulation Complete.")
             st.success("✅ Simulation Complete!")
 
-            # Retrieve final state
             final_metrics = st.session_state.metrics
             initial_metrics = st.session_state.metrics_initial
             final_G = st.session_state.simulation_graph
@@ -766,107 +914,80 @@ Proposal: "{treaty[3]}"
             if final_G.number_of_nodes() > 0:
                 degrees = list(final_G.degree())
                 if degrees:
-                    # Find node with max/min degree
                     most_active = max(degrees, key=lambda x: x[1])[0]
                     least_active = min(degrees, key=lambda x: x[1])[0]
-                # Calculate network density and components
                 final_density = nx.density(final_G)
-                if final_G.number_of_edges() > 0: # Need edges for components
-                     num_components = nx.number_connected_components(final_G)
-                else:
-                     num_components = final_G.number_of_nodes() # Each node is a component
+                if final_G.number_of_edges() > 0: num_components = nx.number_connected_components(final_G)
+                else: num_components = final_G.number_of_nodes()
 
-            # Find strongest positive relationship
             strongest_pair_text = "N/A (No positive relationships)"
             if final_G.number_of_edges() > 0:
-                edge_weights = [( (u, v), final_G[u][v].get('weight', 0) ) for u, v in final_G.edges()]
-                positive_weights = [(pair, w) for pair, w in edge_weights if w > 0]
+                edge_weights = [((u, v), final_G[u][v].get('weight', 0)) for u, v in final_G.edges()]
+                positive_weights = [(pair, w) for pair, w in edge_weights if w > 0.1] # Use threshold
                 if positive_weights:
                     strongest_data = max(positive_weights, key=lambda x: x[1])
-                    strongest_pair_text = f"{strongest_data[0][0]} ↔ {strongest_data[0][1]} (Weight: {strongest_data[1]:.2f})" # Use .2f for weight
+                    strongest_pair_text = f"{strongest_data[0][0]} ↔ {strongest_data[0][1]} (Weight: {strongest_data[1]:.2f})"
 
-            # --- Generate Final Summary Report using Streamlit elements ---
-            with report_placeholder: # Use the container defined earlier
-                st.subheader("Simulation Summary Report") # Changed from h3
+            # --- Generate Final Summary Report ---
+            with report_placeholder:
+                st.subheader("Simulation Summary Report")
                 st.markdown(f"**Scenario:** {scenario}")
-                st.markdown(f"**Duration:** {num_turns} turns")
-                st.markdown(f"**Agreements Reached:** {len(st.session_state.get('simulation_treaties', []))}")
+                st.markdown(f"**Duration:** {num_turns} turns ({len(nations)} agent actions per turn)")
+                st.markdown(f"**Agreements Logged:** {len(st.session_state.get('simulation_agreements', []))}")
                 st.markdown(f"**Network Density:** {final_density:.3f} | **Components:** {num_components}")
 
-                st.subheader("Key Observations") # Changed from h4
+                st.markdown("##### Key Observations")
                 st.markdown(f"* Most active nation (highest degree): **{most_active}**")
-                st.markdown(f"* Strongest positive relationship (highest edge weight): **{strongest_pair_text}**")
+                st.markdown(f"* Strongest positive relationship (highest edge weight > 0.1): **{strongest_pair_text}**")
                 st.markdown(f"* Nation with lowest degree: **{least_active}**")
 
-                st.subheader("Final Metrics (vs Initial)") # Changed from h4
-                # Using markdown with f-strings for formatted output
-                fm_peace = final_metrics.get('Peace Index', 0)
-                im_peace = initial_metrics.get('Peace Index', 0)
+                st.markdown("##### Final Metrics (vs Initial)")
+                fm_peace = final_metrics.get('Peace Index', 0); im_peace = initial_metrics.get('Peace Index', 0)
                 st.markdown(f"* 🕊️ Peace Index: **{fm_peace:.2f}** ({fm_peace - im_peace:+.2f})")
-
-                fm_co2 = final_metrics.get('Carbon Emissions (Gt)', 0)
-                im_co2 = initial_metrics.get('Carbon Emissions (Gt)', 0)
+                fm_co2 = final_metrics.get('Carbon Emissions (Gt)', 0); im_co2 = initial_metrics.get('Carbon Emissions (Gt)', 0)
                 st.markdown(f"* 💨 CO₂ Emissions (Gt): **{fm_co2:.1f}** ({fm_co2 - im_co2:+.1f})")
-
-                fm_ref = final_metrics.get('Refugee Migration (M)', 0)
-                im_ref = initial_metrics.get('Refugee Migration (M)', 0)
+                fm_ref = final_metrics.get('Refugee Migration (M)', 0); im_ref = initial_metrics.get('Refugee Migration (M)', 0)
                 st.markdown(f"* 🚶 Refugees (M): **{int(fm_ref):,}** ({int(fm_ref - im_ref):+,})")
-
-                fm_energy = final_metrics.get('Energy Stability Index', 0)
-                im_energy = initial_metrics.get('Energy Stability Index', 0)
+                fm_energy = final_metrics.get('Energy Stability Index', 0); im_energy = initial_metrics.get('Energy Stability Index', 0)
                 st.markdown(f"* ⚡ Energy Stability: **{fm_energy:.2f}** ({fm_energy - im_energy:+.2f})")
-
-                fm_econ = final_metrics.get('Economic Growth (%)', 0)
-                im_econ = initial_metrics.get('Economic Growth (%)', 0)
+                fm_econ = final_metrics.get('Economic Growth (%)', 0); im_econ = initial_metrics.get('Economic Growth (%)', 0)
                 st.markdown(f"* 📈 Econ Growth (%): **{fm_econ:.1f}%** ({fm_econ - im_econ:+.1f}%)")
 
-
-            # --- Download Button (Transcript Only) ---
+            # --- Download Button ---
             st.markdown("---")
             st.subheader("📥 Download Results")
 
-            # Prepare transcript data
-            transcript_data = f"PoliBot Pro Simulation Transcript\nScenario: {scenario}\nTurns: {num_turns}\nDate: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n---\n\n"
-            # Convert HTML log entries to plain text for download
+            # Prepare transcript data (plain text)
+            transcript_data = f"PoliBot Agents Simulation Transcript\nScenario: {scenario}\nTurns: {num_turns}\nNations: {', '.join(nations)}\nDate: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n---\n\nAGENT ACTION LOG (Newest First):\n\n"
             plain_log_entries = []
-            for entry in reversed(st.session_state.simulation_dialogue): # Reverse back to chronological order
+            for entry in st.session_state.simulation_log: # Already newest first
                 if isinstance(entry, str):
-                    # Basic text conversion from the HTML log entry
-                    text_entry = entry.replace('<div class="log-entry">', '')
-                    text_entry = text_entry.replace('</div>', '')
-                    text_entry = text_entry.replace('<br>', '\n')
-                    text_entry = text_entry.replace('<strong>', '') # Remove strong tags
-                    text_entry = text_entry.replace('</strong>', '')
-                    text_entry = text_entry.replace('<em>', '') # Remove emphasis tags
-                    text_entry = text_entry.replace('</em>', '')
-                    plain_log_entries.append(text_entry.strip())
+                    text_entry = re.sub(r'<[^>]+>', '', entry) # Basic HTML tag removal
+                    text_entry = text_entry.replace('&nbsp;', ' ') # Replace non-breaking space
+                    text_entry = "\n".join([line.strip() for line in text_entry.splitlines() if line.strip()]) # Clean up lines
+                    plain_log_entries.append(text_entry)
             transcript_data += "\n\n---\n\n".join(plain_log_entries)
 
-            # Single download button for the transcript
             st.download_button(
-                label="📄 Download Full Transcript (.txt)",
+                label="📄 Download Full Action Log (.txt)",
                 data=transcript_data,
-                file_name=f"PoliBot_Transcript_{scenario.split(' ')[0]}_{datetime.now().strftime('%Y%m%d')}.txt",
+                file_name=f"PoliBot_AgentLog_{scenario.split(' ')[0]}_{datetime.now().strftime('%Y%m%d')}.txt",
                 mime="text/plain",
-                use_container_width=True, # Make button wide
+                use_container_width=True,
                 key="dl_transcript"
             )
 
         except Exception as sim_e:
-             # Catch and display errors during the simulation loop
              st.error(f"An error occurred during the simulation: {sim_e}", icon="🔥")
-             # Log the full traceback to console/terminal for detailed debugging
              print("--- Simulation Error Traceback ---")
              traceback.print_exc()
              print("---------------------------------")
-             # Also display traceback in Streamlit app for user visibility
              st.exception(sim_e)
         finally:
-             # Ensure progress bar and status text are cleared regardless of success/failure
              progress_bar_placeholder.empty()
              status_text_placeholder.empty()
 
 
 # --- Footer ---
 st.markdown("---")
-st.caption("PoliBot Pro v1.4 - Global Crisis Negotiation Simulator")
+st.caption("PoliBot Agents v1.0 - Global Crisis Negotiation Simulator")
